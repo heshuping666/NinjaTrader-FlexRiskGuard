@@ -29,6 +29,38 @@ namespace NinjaTrader.NinjaScript.AddOns
         private TextBox mllInput, stopInput, qtyInput;
         private ComboBox instrumentInput;
         private TextBlock status, figures, preflight;
+        private readonly List<TextBlock> accountCells = new List<TextBlock>();
+
+        private Grid BuildAccountTable()
+        {
+            accountCells.Clear();
+            Grid table = new Grid { Background = Brushes.White, MinWidth = 770 };
+            table.RowDefinitions.Add(new RowDefinition { Height = new GridLength(36) });
+            table.RowDefinitions.Add(new RowDefinition { Height = new GridLength(44) });
+            string[] headings = { "状态", "账户", "日内盈亏 $", "权益 $", "MLL $", "缓冲 $", "入场", "冷静期" };
+            for (int i = 0; i < headings.Length; i++)
+            {
+                table.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(i == 1 ? 130 : 95) });
+                for (int row = 0; row < 2; row++)
+                {
+                    TextBlock text = new TextBlock { Text = row == 0 ? headings[i] : "—",
+                        VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 6, 0),
+                        Foreground = Brushes.Black, FontSize = 12,
+                        FontWeight = row == 0 ? FontWeights.SemiBold : FontWeights.Normal };
+                    Border cell = new Border { Child = text, BorderBrush = Brushes.LightGray,
+                        BorderThickness = new Thickness(0, 0, 1, 1),
+                        Background = row == 0 ? Brushes.WhiteSmoke : Brushes.White };
+                    Grid.SetColumn(cell, i); Grid.SetRow(cell, row); table.Children.Add(cell);
+                    if (row == 1) accountCells.Add(text);
+                }
+            }
+            return table;
+        }
+
+        private void ClearAccountTable()
+        {
+            foreach (TextBlock cell in accountCells) { cell.Text = "—"; cell.ToolTip = null; }
+        }
         private DispatcherTimer timer;
         private Account account;
         private string currentAccountName = "";
@@ -42,13 +74,117 @@ namespace NinjaTrader.NinjaScript.AddOns
         private HashSet<string> seenEntryOrders = new HashSet<string>();
         private HashSet<string> seenExecutions = new HashSet<string>();
         private HashSet<Order> cancellationRequested = new HashSet<Order>();
+        private readonly Dictionary<Order, string> cancellationReasons = new Dictionary<Order, string>();
         private readonly object guard = new object();
+        private readonly object logGuard = new object();
+        private readonly Queue<string> logLines = new Queue<string>();
+        private TextBox logView;
+        private TextBlock logSummary;
+        private long logVersion, renderedLogVersion = -1;
+        private string latestRiskAction = "本次会话尚无风控操作";
+        private readonly HashSet<Order> reportedOrderResults = new HashSet<Order>();
+        private string lastMetricsError = "";
+        private bool dailyLossTripped;
+        private string stateError = "";
+        private bool refreshingAccounts;
+
+        // Fixed UTC+8, 06:00 boundary. Session label is its starting Beijing date.
+        private static DateTime SessionDate(DateTime utc)
+        {
+            return utc.AddHours(8).AddHours(-6).Date;
+        }
+        private static bool Finite(double x) { return !Double.IsNaN(x) && !Double.IsInfinity(x); }
+
+        private readonly P0Store behavior = new P0Store();
+        private TextBox cooldownMinutes;
+        private void BehaviorAction(string action)
+        {
+            if (account == null) return;
+            try
+            {
+                int minutes;
+                if (!Int32.TryParse(cooldownMinutes.Text, out minutes) || minutes < 1 || minutes > 1440)
+                    throw new InvalidOperationException("冷静期需为 1–1440 分钟");
+                if ((action == "resume" || action == "globalResume") && MessageBox.Show(
+                    "确认恢复插件内部状态？本插件不会阻断 NT8 订单。", "恢复确认", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
+                behavior.Change(account.Name, action, minutes);
+                LogEvent("P0 操作", action + "；状态已保存", true);
+            }
+            catch (Exception ex) { LogEvent("P0 操作失败", ex.Message, true); }
+            RefreshMetrics(); RefreshLog();
+        }
+
+        private void EvaluateRisk()
+        {
+            Account a = account;
+            if (a == null) return;
+            double r = a.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
+            double u = a.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+            double n = a.Get(AccountItem.NetLiquidation, Currency.UsDollar);
+            DateTime session = SessionDate(DateTime.UtcNow);
+            bool reset = false, save = false, changed;
+            string next;
+            bool flat = !HasPosition(a) && !HasActiveOrder(a);
+            lock (guard)
+            {
+                if (stateError == "" && tradingDate < session && flat && Finite(r) && Finite(u) && Valid(n))
+                {
+                    tradingDate = session; realizedStart = r; entries = 0;
+                    dailyLossTripped = false;
+                    seenEntryOrders.Clear(); seenExecutions.Clear();
+                    reset = true; save = true;
+                }
+                if (tradingDate == session && Finite(r) && Finite(u) &&
+                    r - realizedStart + u <= -DailyLossCap && !dailyLossTripped)
+                { dailyLossTripped = true; save = true; }
+                next = behavior.Status(a.Name);
+                if (stateError != "") next = stateError;
+                if (!Finite(r) || !Finite(u) || !Valid(n)) next = "数据不可靠：账户数值不可用";
+                var blockers = new List<string>();
+                if (next != "内部未锁定 · 仅监控") blockers.Add(next);
+                bool nextLocked = blockers.Count > 0;
+                changed = locked != nextLocked || reason != next;
+                locked = nextLocked; reason = next;
+            }
+            if (reset) LogEvent("自动换日", "交易日 " + session.ToString("yyyy-MM-dd") + "；北京时间 06:00 切换，已建立盈亏基准并清零入场次数。", true);
+            if (save) SaveState();
+            if (changed) LogEvent(locked ? "禁止新开仓" : "允许交易", reason, true);
+        }
+
+        private void LogEvent(string category, string message, bool riskAction = false)
+        {
+            lock (logGuard)
+            {
+                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " ["
+                    + (String.IsNullOrEmpty(currentAccountName) ? "未绑定" : currentAccountName)
+                    + "] [" + category + "] " + message;
+                logLines.Enqueue(line);
+                while (logLines.Count > 500) logLines.Dequeue();
+                if (riskAction) latestRiskAction = line;
+                logVersion++;
+            }
+        }
+
+        // Account callbacks only enqueue text; the UI timer renders it on its dispatcher.
+        private void RefreshLog()
+        {
+            if (logView == null) return;
+            lock (logGuard)
+            {
+                if (renderedLogVersion == logVersion) return;
+                logView.Text = String.Join(Environment.NewLine, logLines.ToArray());
+                logSummary.Text = "最近风控操作：" + latestRiskAction;
+                logSummary.ToolTip = logSummary.Text;
+                renderedLogVersion = logVersion;
+            }
+            logView.ScrollToEnd();
+        }
 
         // SIM research defaults. These are NOT official FundedNext limits.
         private const double MaxSingleRisk = 150.0;
         private const double MaxCombinedRisk = 200.0; // advisory only; existing stops not reliably reconstructed
         private const double DailyLossCap = 300.0;
-        private const int EntryCap = 3;
+        private const int EntryCap = 5;
         private const double BufferFloor = 500.0;
 
         protected override void OnStateChange()
@@ -56,7 +192,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (State == State.SetDefaults)
             {
                 Name = "FlexRiskGuard50K";
-                Description = "SIM ONLY: 50K Flex risk monitor and best-effort locked-entry cancellation";
+                Description = "SIM ONLY: P0 internal lock state monitor; no order control";
             }
             else if (State == State.Terminated)
             {
@@ -100,26 +236,58 @@ namespace NinjaTrader.NinjaScript.AddOns
             panel = new Window
             {
                 Title = "Flex Risk Guard 50K — SIM ONLY",
-                Width = 555,
-                Height = 680,
-                MinWidth = 505,
+                Width = 1180,
+                Height = 760,
+                MinWidth = 900,
+                MinHeight = 600,
                 WindowStartupLocation = WindowStartupLocation.CenterScreen,
                 Background = Brushes.White
             };
             ScrollViewer scroller = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            StackPanel body = new StackPanel { Margin = new Thickness(18) };
+            StackPanel body = new StackPanel { Margin = new Thickness(8) };
             scroller.Content = body;
-            panel.Content = scroller;
+            Grid layout = new Grid { Margin = new Thickness(10) };
+            layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(270) });
+            layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            layout.Children.Add(scroller);
+            Grid right = new Grid { Margin = new Thickness(16, 8, 8, 8) };
+            right.RowDefinitions.Add(new RowDefinition { Height = new GridLength(230) });
+            right.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(right, 1);
+            layout.Children.Add(right);
+            StackPanel overview = new StackPanel();
+            right.Children.Add(new ScrollViewer { Content = overview, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
+            Grid logArea = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+            logArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            logArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            logArea.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid.SetRow(logArea, 1);
+            right.Children.Add(logArea);
+            logArea.Children.Add(Label("操作日志 · 本次会话最近 500 条", true));
+            logSummary = Label("", false);
+            logSummary.TextWrapping = TextWrapping.NoWrap;
+            logSummary.TextTrimming = TextTrimming.CharacterEllipsis;
+            Grid.SetRow(logSummary, 1);
+            logArea.Children.Add(logSummary);
+            logView = new TextBox { IsReadOnly = true, AcceptsReturn = true,
+                TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Background = Brushes.WhiteSmoke, Foreground = Brushes.Black,
+                FontFamily = new FontFamily("Consolas"), FontSize = 12, Padding = new Thickness(10) };
+            Grid.SetRow(logView, 2);
+            logArea.Children.Add(logView);
+            renderedLogVersion = -1;
+            panel.Content = layout;
 
-            body.Children.Add(Label("SIM-ONLY  |  仅供模拟验证，不能保证拦截已提交订单", true));
-            body.Children.Add(Label("账户（仅显示名称以 Sim 开头的账户）：", false));
+            body.Children.Add(Label("Flex Risk Guard · SIM", true));
+            body.Children.Add(Label("模拟账户", true));
             accounts = new ComboBox { Height = 30, Margin = new Thickness(0, 4, 0, 10) };
             body.Children.Add(accounts);
-            Button refresh = Btn("刷新模拟账户", () => RefreshAccountList());
+            Button refresh = Btn("刷新账户列表", () => RefreshAccountList());
+            refresh.ToolTip = "仅刷新可选模拟账户，不重置冷静期或风控统计。";
             body.Children.Add(refresh);
-            accounts.SelectionChanged += (s, e) => SelectAccount();
+            accounts.SelectionChanged += (s, e) => { if (!refreshingAccounts) SelectAccount(); };
 
-            body.Children.Add(Label("当前生效的 Maximum Loss Limit（手动输入，USD）：", false));
+            body.Children.Add(Label("MLL · USD", true));
             mllInput = new TextBox { Height = 28, Text = "", Margin = new Thickness(0, 4, 0, 5) };
             body.Children.Add(mllInput);
             body.Children.Add(Btn("保存当前 MLL", SaveMll));
@@ -128,26 +296,36 @@ namespace NinjaTrader.NinjaScript.AddOns
             status.Foreground = Brushes.DarkRed;
             status.TextWrapping = TextWrapping.Wrap;
             status.Margin = new Thickness(0, 15, 0, 8);
-            body.Children.Add(status);
+            overview.Children.Add(Label("账户监控", true));
+            overview.Children.Add(status);
             figures = Label("", false);
             figures.TextWrapping = TextWrapping.Wrap;
-            body.Children.Add(figures);
+            overview.Children.Add(new ScrollViewer { Content = BuildAccountTable(),
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Disabled });
+            Expander details = new Expander { Header = "锁定原因 / 状态详情", Content = figures,
+                Margin = new Thickness(0, 8, 0, 0) };
+            overview.Children.Add(details);
+            body.Children.Add(Label("风控操作", true));
 
-            body.Children.Add(Btn("开始新交易日（需空仓且无活动订单）", StartDay));
-            body.Children.Add(Btn("手动锁定（不平仓）", () => Lock("手动锁定")));
-            body.Children.Add(Btn("第一次违规：30 分钟冷静期", () =>
-            {
-                lock (guard) pauseUntil = DateTime.Now.AddMinutes(30);
-                Lock("违规冷静期；到期后仍需人工复核并解锁");
-            }));
-            body.Children.Add(Btn("模拟测试：复核后解锁", UnlockAfterReview));
+            body.Children.Add(Label("自动检查 · 北京时间 06:00 换日", false));
+            cooldownMinutes = new TextBox { Text = "30", Height = 28 };
+            body.Children.Add(Label("冷静期（分钟）", false));
+            body.Children.Add(cooldownMinutes);
+            body.Children.Add(Btn("锁定当前账户", () => BehaviorAction("lock")));
+            body.Children.Add(Btn("恢复当前账户", () => BehaviorAction("resume")));
+            body.Children.Add(Btn("记录违规 / 冷静期", () => BehaviorAction("violation")));
+            body.Children.Add(Btn("结束当日交易", () => BehaviorAction("endDay")));
+            body.Children.Add(Btn("锁定全部模拟账户", () => BehaviorAction("globalLock")));
+            body.Children.Add(Btn("恢复全局锁定", () => BehaviorAction("globalResume")));
+            body.Children.Add(Label("P0 仅记录内部状态，不撤单、不平仓、不阻断下单。", true));
 
-            body.Children.Add(Label("单笔风险预检查（不执行下单）", true));
+            body.Children.Add(Label("风险计算 · 不下单", true));
             instrumentInput = new ComboBox { Height = 28, Margin = new Thickness(0, 4, 0, 5) };
             instrumentInput.Items.Add("MNQ"); instrumentInput.Items.Add("MES"); instrumentInput.Items.Add("MGC");
             instrumentInput.SelectedIndex = 0;
             body.Children.Add(instrumentInput);
-            body.Children.Add(Label("结构性止损距离（MNQ/MES 用指数点，MGC 用黄金价格 USD）：", false));
+            body.Children.Add(Label("止损距离（点 / MGC 价格美元）", false));
             stopInput = new TextBox { Text = "75", Height = 28 };
             body.Children.Add(stopInput);
             body.Children.Add(Label("手数：", false));
@@ -157,9 +335,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             preflight = Label("", false);
             preflight.TextWrapping = TextWrapping.Wrap;
             body.Children.Add(preflight);
-            body.Children.Add(Label("注意：单笔 $150、合计 $200、日亏 $300、3 笔、缓冲 $500 均是研究参数。\n"
+            body.Children.Add(new Expander { Header = "规则与使用说明", Margin = new Thickness(0, 10, 0, 0), Content = Label("交易日按北京时间 06:00 自动切换；跨日待空仓、无活动订单后重置统计。锁定不平仓；关闭面板会停止监控。\n注意：单笔 $150、合计 $200、日亏 $300、3 笔、缓冲 $500 均是研究参数。\n"
                 + "监控不计算手续费/滑点；不能从普通 Chart Trader 下单前确认你的结构止损。\n"
-                + "锁定时仅在模拟账户中尝试取消新的开仓单；不能阻止瞬时成交、其他终端下单，且可能无法识别复杂 ATM/反手订单。", false));
+                + "P0 仅管理内部锁定状态，不提交、不撤销、不平仓任何订单。", false) });
 
             // Closing the window MUST NOT silently lift a lock.
             panel.Closed += (s, e) =>
@@ -170,9 +348,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             };
 
             timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-            timer.Tick += (s, e) => RefreshMetrics();
+            timer.Tick += (s, e) => { RefreshMetrics(); RefreshLog(); };
             timer.Start();
             RefreshAccountList();
+            LogEvent("界面", "面板已打开；日志仅保留本次程序会话，不写入磁盘。");
+            RefreshLog();
             panel.Show();
         }
 
@@ -185,6 +365,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 FontWeight = title ? FontWeights.SemiBold : FontWeights.Normal,
                 Margin = new Thickness(0, title ? 9 : 5, 0, 4),
                 Foreground = title ? Brushes.Black : Brushes.DimGray
+                , TextWrapping = TextWrapping.Wrap
             };
         }
 
@@ -202,10 +383,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             lock (Account.All)
                 names = Account.All.Where(a => a.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase))
                     .Select(a => a.Name).OrderBy(x => x).ToList();
+            refreshingAccounts = true;
             accounts.Items.Clear();
             foreach (string name in names) accounts.Items.Add(name);
             if (names.Count > 0)
                 accounts.SelectedItem = names.Contains(previouslySelected) ? previouslySelected : names[0];
+            refreshingAccounts = false;
+            SelectAccount();
         }
 
         private void SelectAccount()
@@ -219,16 +403,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 { account = null; return; }
             currentAccountName = name;
             LoadState();
-            // Fail-closed after process restart or reattachment: never auto-unlock.
+            // Stay blocked until current settings and persisted risk state have been evaluated.
             lock (guard)
             {
                 locked = true;
-                reason = "启动/切换账户后需人工核对状态并解锁";
+                reason = "正在自动检查风控条件";
             }
             SaveState();
             account.ExecutionUpdate += OnExecutionUpdate;
-            account.OrderUpdate += OnOrderUpdate;
+            // P0: no order cancellation subscription.
             account.AccountItemUpdate += OnAccountItemUpdate;
+            LogEvent("监控", "已订阅账户事件；自动检查风控条件。", true);
             mllInput.Text = Double.IsNaN(manualMll) ? "" : manualMll.ToString("F2", CultureInfo.InvariantCulture);
             RefreshMetrics();
         }
@@ -237,8 +422,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (account != null)
             {
+                LogEvent("监控停止", "已解除账户事件订阅；此账户不再受本面板监控。");
                 account.ExecutionUpdate -= OnExecutionUpdate;
-                account.OrderUpdate -= OnOrderUpdate;
+
                 account.AccountItemUpdate -= OnAccountItemUpdate;
             }
             account = null;
@@ -257,6 +443,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             lock (guard)
             {
+                stateError = ""; dailyLossTripped = false;
                 locked = true;
                 tradingDate = DateTime.MinValue;
                 realizedStart = 0;
@@ -265,28 +452,34 @@ namespace NinjaTrader.NinjaScript.AddOns
                 seenEntryOrders.Clear();
                 seenExecutions.Clear();
                 cancellationRequested.Clear();
+                cancellationReasons.Clear();
+                reportedOrderResults.Clear();
                 pauseUntil = DateTime.MinValue;
                 string path = StateFile();
                 if (!File.Exists(path)) return;
                 try
                 {
                     string[] lines = File.ReadAllLines(path);
-                    if (lines.Length < 5) return;
+                    if (lines.Length < 5) throw new InvalidDataException("状态文件不完整");
                     tradingDate = DateTime.Parse(lines[0], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
                     realizedStart = double.Parse(lines[1], CultureInfo.InvariantCulture);
                     entries = int.Parse(lines[2], CultureInfo.InvariantCulture);
                     double x;
-                    if (double.TryParse(lines[3], NumberStyles.Float, CultureInfo.InvariantCulture, out x) && x > 0)
+                    if (double.TryParse(lines[3], NumberStyles.Float, CultureInfo.InvariantCulture, out x) && Valid(x))
                         manualMll = x;
                     pauseUntil = DateTime.Parse(lines[4], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                    dailyLossTripped = lines.Contains("DAILY_LOSS=TRUE");
+                    if (!Finite(realizedStart) || entries < 0) throw new InvalidDataException("无效统计数据");
+                    // Old files used PC calendar dates; retain restrictions and baseline conservatively.
+                    if (!lines.Contains("SESSION=BEIJING_0600_V1")) tradingDate = SessionDate(DateTime.UtcNow);
                 }
-                catch (Exception) { locked = true; reason = "状态文件异常，必须人工检查"; }
+                catch (Exception) { locked = true; stateError = "状态文件异常，需修复后重新加载"; reason = stateError; }
             }
         }
 
         private void SaveState()
         {
-            if (String.IsNullOrEmpty(currentAccountName)) return;
+            if (String.IsNullOrEmpty(currentAccountName) || stateError != "") return;
             try
             {
                 string data;
@@ -296,13 +489,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                         + entries.ToString(CultureInfo.InvariantCulture) + "\n"
                         + manualMll.ToString("R", CultureInfo.InvariantCulture) + "\n"
                         + pauseUntil.ToString("o", CultureInfo.InvariantCulture) + "\n"
-                        + "LOCKED=TRUE; re-arm required after restart\n";
+                        + "SESSION=BEIJING_0600_V1\n"
+                        + (dailyLossTripped ? "DAILY_LOSS=TRUE\n" : "DAILY_LOSS=FALSE\n");
                 File.WriteAllText(StateFile(), data, Encoding.UTF8);
             }
             catch (Exception ex)
             {
                 // Do not mistake an unwritable file for a working persistent lock.
-                lock (guard) { locked = true; reason = "状态保存失败：" + ex.Message; }
+                lock (guard) { locked = true; stateError = "状态保存失败：" + ex.Message; reason = stateError; }
+                LogEvent("错误", reason, true);
             }
         }
 
@@ -317,62 +512,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return a.Positions.Any(p => p.MarketPosition != MarketPosition.Flat && p.Quantity != 0);
         }
 
-        private void StartDay()
-        {
-            if (account == null) return;
-            if (HasPosition(account) || HasActiveOrder(account))
-            {
-                MessageBox.Show("必须先空仓、确认无活动订单，再初始化新交易日。"); return;
-            }
-            if (MessageBox.Show("这将清零本插件的入场计数和日内盈亏基准。请先核对 NT8 成交记录及平台状态。继续？",
-                    "确认", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
-            lock (guard)
-            {
-                tradingDate = DateTime.Now.Date; // PC-local date, not broker/session boundary
-                realizedStart = account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
-                entries = 0;
-                seenEntryOrders.Clear(); seenExecutions.Clear(); cancellationRequested.Clear();
-                pauseUntil = DateTime.MinValue;
-                locked = true; reason = "新交易日已初始化，仍需复核后手动解锁";
-            }
-            SaveState(); RefreshMetrics();
-        }
-
         private void SaveMll()
         {
             if (account == null) return;
             double x;
-            if (!double.TryParse(mllInput.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out x) || x <= 0)
+            if (!double.TryParse(mllInput.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out x) || !Valid(x))
             { MessageBox.Show("输入有效的 USD MLL，例如 48500。必须与选定模拟账户权益相匹配。"); return; }
             lock (guard) manualMll = x;
-            SaveState(); RefreshMetrics();
-        }
-
-        private void Lock(string why)
-        {
-            lock (guard) { locked = true; reason = why; }
-            SaveState();
-            RefreshMetrics();
-        }
-
-        private void UnlockAfterReview()
-        {
-            if (account == null) return;
-            if (tradingDate != DateTime.Now.Date)
-            { MessageBox.Show("先执行“开始新交易日”并核对已有成交；本插件按电脑本地日期计日。"); return; }
-            if (DateTime.Now < pauseUntil)
-            { MessageBox.Show("冷静期尚未结束，不能解锁。"); return; }
-            if (HasPosition(account) || HasActiveOrder(account))
-            { MessageBox.Show("测试版本只允许在空仓且无活动订单时解锁。"); return; }
-            if (Double.IsNaN(manualMll))
-            { MessageBox.Show("请先输入并保存手动 MLL。"); return; }
-            double realized = account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
-            double nlv = account.Get(AccountItem.NetLiquidation, Currency.UsDollar);
-            if (!Valid(nlv) || nlv - manualMll < BufferFloor || entries >= EntryCap || realized - realizedStart <= -DailyLossCap)
-            { MessageBox.Show("未满足解锁条件：请核对权益/MLL/日亏或笔数。"); return; }
-            if (MessageBox.Show("仅模拟账户：你已确认状态、MLL、持仓、挂单和交易记录？\n本插件不能阻止所有订单。",
-                "复核解锁", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
-            lock (guard) { locked = false; reason = "已解锁（模拟测试）"; }
+            LogEvent("设置", "MLL 已设置为 " + x.ToString("F2", CultureInfo.InvariantCulture) + " USD");
             SaveState(); RefreshMetrics();
         }
 
@@ -399,36 +546,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (entry && !String.IsNullOrEmpty(orderKey) && seenEntryOrders.Add(orderKey))
                 { entries++; changed = true; }
             }
-            if (changed) SaveState();
-            if (panel != null) panel.Dispatcher.BeginInvoke(new Action(RefreshMetrics));
-        }
-
-        private void OnOrderUpdate(object sender, OrderEventArgs e)
-        {
-            if (account == null || e.Order == null) return;
-            bool isLocked;
-            lock (guard) isLocked = locked;
-            if (!isLocked) return;
-            if (e.OrderState != OrderState.Submitted &&
-                e.OrderState != OrderState.Accepted && e.OrderState != OrderState.Working) return;
-
-            // Conservative: only cancel clearly opening orders while FLAT on this instrument.
-            // Never cancel stop/target orders for an existing position.
-            bool flat = true;
-            lock (account.Positions)
-                flat = !account.Positions.Any(p => p.Instrument == e.Order.Instrument &&
-                    p.MarketPosition != MarketPosition.Flat && p.Quantity != 0);
-            if (!flat) return;
-            bool opening = e.Order.OrderAction == OrderAction.Buy ||
-                           e.Order.OrderAction == OrderAction.SellShort ||
-                           e.Order.OrderAction == OrderAction.Sell;
-            if (!opening) return;
-            lock (guard)
-                if (!cancellationRequested.Add(e.Order)) return;
-            try { account.Cancel(new[] { e.Order }); }
-            catch (Exception ex)
+            if (changed)
             {
-                lock (guard) reason = "撤单失败，立即人工检查：" + ex.Message;
+                LogEvent("入场计数", "订单 " + orderKey + "，当前计数 " + entries + "/" + EntryCap);
+                SaveState();
             }
             if (panel != null) panel.Dispatcher.BeginInvoke(new Action(RefreshMetrics));
         }
@@ -436,48 +557,57 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void RefreshMetrics()
         {
             if (status == null || figures == null) return;
-            if (account == null) { status.Text = "未连接模拟账户"; figures.Text = ""; return; }
+            if (account == null) { status.Text = "● 未绑定"; status.Foreground = Brushes.Gray; status.ToolTip = null; figures.Text = "请选择模拟账户。"; ClearAccountTable(); return; }
             double r, u, nlv;
             try
             {
+                EvaluateRisk();
                 r = account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
                 u = account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
                 nlv = account.Get(AccountItem.NetLiquidation, Currency.UsDollar);
             }
             catch (Exception ex)
             {
-                Lock("无法读取账户数值：" + ex.Message); return;
+                if (lastMetricsError != ex.Message) LogEvent("账户读取错误", ex.Message + "；已锁定。", true);
+                lastMetricsError = ex.Message;
+                lock (guard) { locked = true; reason = "无法读取账户数值：" + ex.Message; }
+                SaveState();
+                status.Text = "已锁定 | " + reason;
+                status.Foreground = Brushes.DarkRed;
+                figures.Text = "账户数值不可用；请检查连接。";
+                ClearAccountTable();
+                return;
             }
+            if (lastMetricsError != "") LogEvent("账户读取恢复", "已恢复读取；重新自动检查条件。");
+            lastMetricsError = "";
             double baseline; int count; bool isLocked; DateTime date, until; string why; double mll;
             lock (guard)
             { baseline = realizedStart; count = entries; isLocked = locked;
               date = tradingDate; until = pauseUntil; why = reason; mll = manualMll; }
             double sessionPnl = (r - baseline) + u;
             double buffer = nlv - mll;
-            if (!isLocked && (date != DateTime.Now.Date ||
-                sessionPnl <= -DailyLossCap || count >= EntryCap ||
-                !Valid(nlv) || Double.IsNaN(mll) || buffer < BufferFloor))
-            {
-                Lock("触发日期/亏损/笔数/回撤缓冲安全条件"); return;
-            }
-            status.Text = (isLocked ? "🔒 已锁定" : "● 已解锁") + "  |  " + why;
+            status.Text = isLocked ? "● 内部锁定 · 订单未阻断" : "● 内部未锁定 · 仅监控";
+            status.ToolTip = why;
             status.Foreground = isLocked ? Brushes.DarkRed : Brushes.DarkGreen;
-            figures.Text = "账户：" + account.Name + "\n"
-                + "当前模式：仅模拟账户；锁单尝试撤单，不保证成功\n"
-                + "日内近似净盈亏：" + (date == DateTime.Now.Date ? sessionPnl.ToString("F2") : "未初始化") + " USD\n"
-                + "成交开仓订单数：" + count + "/" + EntryCap + "（可能遗漏离线或复杂 ATM 成交）\n"
-                + "净清算权益：" + nlv.ToString("F2") + " USD\n"
-                + "手动 MLL：" + (Double.IsNaN(mll) ? "未设置" : mll.ToString("F2")) + " USD\n"
-                + "剩余回撤估算：" + (Double.IsNaN(mll) ? "未知" : buffer.ToString("F2")) + " USD\n"
-                + "冷静期结束：" + (until > DateTime.Now ? until.ToString("yyyy-MM-dd HH:mm:ss") : "无") + "\n"
-                + "合计持仓风险（$" + MaxCombinedRisk + "）：未自动验证，需独立监控";
+            string[] values = { isLocked ? "● 锁定" : "● 未锁定", account.Name,
+                date == SessionDate(DateTime.UtcNow) ? sessionPnl.ToString("F2") : "未初始化",
+                nlv.ToString("F2"), Double.IsNaN(mll) ? "未设置" : mll.ToString("F2"),
+                Double.IsNaN(mll) ? "—" : buffer.ToString("F2"), count + "/" + EntryCap,
+                behavior.Countdown(account.Name) };
+            for (int i = 0; i < values.Length; i++)
+            { accountCells[i].Text = values[i]; accountCells[i].ToolTip = values[i]; }
+            accountCells[0].Foreground = status.Foreground;
+            accountCells[0].ToolTip = why;
+            accountCells[2].Foreground = date != SessionDate(DateTime.UtcNow) ? Brushes.Gray : sessionPnl < 0 ? Brushes.DarkRed : Brushes.DarkGreen;
+            accountCells[5].Foreground = buffer < BufferFloor ? Brushes.DarkRed : Brushes.Black;
+            figures.Text = why + "\nP1 数据未核对：盈亏和入场为近似统计，无法重建离线成交；不参与自动订单控制。";
         }
 
         private void ComputePreflight()
         {
             double distance; int qty;
             if (!double.TryParse(stopInput.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out distance) ||
-                !int.TryParse(qtyInput.Text, out qty) || distance <= 0 || qty <= 0)
+                !int.TryParse(qtyInput.Text, out qty) || !Valid(distance) || qty <= 0)
             { preflight.Text = "输入正数止损距离、正整数手数；使用英文小数点。"; return; }
             string sym = instrumentInput.SelectedItem as string;
             double pointValue = sym == "MNQ" ? 2 : sym == "MES" ? 5 : 10;
@@ -492,3 +622,5 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
     }
 }
+
+
